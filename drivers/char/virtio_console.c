@@ -190,6 +190,8 @@ struct port {
 	/* Protect the operations on the out_vq. */
 	spinlock_t outvq_lock;
 
+	spinlock_t write_lock;
+
 	/* The IO vqs for this port */
 	struct virtqueue *in_vq, *out_vq;
 
@@ -238,10 +240,14 @@ struct port {
 
 	bool tiocm_updated;
 	int tiocm;
+	bool is_outvq_filled;
+//	struct mutex port_mutex;
 };
 
 /* This is the very early arch-specified put chars function. */
 static int (*early_put_chars)(u32, const char *, int);
+
+static int wait_port_writable(struct port *port, bool nonblock);
 
 static struct port *find_port_by_vtermno(u32 vtermno)
 {
@@ -815,6 +821,7 @@ static ssize_t port_fops_write(struct file *filp, const char __user *ubuf,
 	bool nonblock;
 	struct scatterlist sg[1];
 
+		printk("vc write\n");
 	/* Userspace could be out to fool us */
 	if (!count)
 		return 0;
@@ -1124,6 +1131,7 @@ static int put_chars(u32 vtermno, const char *buf, int count)
 	struct scatterlist sg[1];
 	void *data;
 	int ret;
+	unsigned int len;
 
 	if (unlikely(early_put_chars))
 		return early_put_chars(vtermno, buf, count);
@@ -1132,13 +1140,54 @@ static int put_chars(u32 vtermno, const char *buf, int count)
 	if (!port)
 		return -EPIPE;
 
+//	if (will_write_block(port)) {
+//		printk("b\n");
+//		return 0;
+//	}
+	
+	if (!spin_trylock(&port->write_lock)) {
+		return 0;
+	}
+	if (port->is_outvq_filled && !virtqueue_get_buf(port->out_vq, &len)) {
+		spin_unlock(&port->write_lock);
+		return 0;
+	}
+#if 0
+	/* Has the backend released the buffer we filled last time? */
+	if (port->is_outvq_filled && !virtqueue_get_buf(port->out_vq, &len) ) {
+//		printk("b\n");
+		spin_unlock(&port->write_lock);
+		return 0;
+	}
+#endif
+	port->is_outvq_filled = false;
+
+//	printk("p\n");
+
 	data = kmemdup(buf, count, GFP_ATOMIC);
-	if (!data)
+	if (!data) {
+		spin_unlock(&port->write_lock);
 		return -ENOMEM;
+	}
 
 	sg_init_one(sg, data, count);
-	ret = __send_to_port(port, sg, 1, count, data, false);
-	kfree(data);
+	ret = __send_to_port(port, sg, 1, count, data, true);
+	port->is_outvq_filled = true;
+	spin_unlock(&port->write_lock);
+	/*
+	if (virtio_has_feature(port, VIRTIO_CONSOLE_F_UART_BE)) {
+		mutex_lock(&port->port_mutex);
+		port->write_done = false;
+		ret = __send_to_port(port, sg, 1, count, data, false);
+		wait_event_freezable(port->waitqueue, port->);
+		mutex_unlock(&port->port_mutex);
+	} else {
+		ret = __send_to_port(port, sg, 1, count, data, false);
+	} */
+
+//	printk("o\n");
+
+	//kfree(data);
 	return ret;
 }
 
@@ -1216,6 +1265,8 @@ static void virtio_console_set_termios(struct hvc_struct *hp, const struct kterm
 	if(!virtio_has_feature(port->portdev->vdev, VIRTIO_CONSOLE_F_UART_BE))
 		return;
 
+//	mutex_lock(&port->port_mutex);
+
 	if (tty->termios.c_ospeed != old->c_ospeed) {
 		value = (uint16_t)(tty->termios.c_cflag & CBAUD);
 		send_control_msg(port, VIRTIO_CONSOLE_SET_TERMIO_OBAUD, value);
@@ -1232,6 +1283,7 @@ static void virtio_console_set_termios(struct hvc_struct *hp, const struct kterm
 		value = (tty->termios.c_cflag & CRTSCTS) ? 1 : 0;
 		send_control_msg(port, VIRTIO_CONSOLE_SET_TERMIO_CRTSCTS, value);
 	}
+//	mutex_unlock(&port->port_mutex);
 }
 
 static int virtio_console_tiocmget(struct hvc_struct *hp)
@@ -1246,10 +1298,14 @@ static int virtio_console_tiocmget(struct hvc_struct *hp)
 	if(!virtio_has_feature(port->portdev->vdev, VIRTIO_CONSOLE_F_UART_BE))
 		return -EPERM;
 
+//	mutex_lock(&port->port_mutex);
+
 	port->tiocm_updated = false;
 	send_control_msg(port, VIRTIO_CONSOLE_TIOCMGET, 0);
 
 	ret = wait_event_freezable(port->waitqueue, port->tiocm_updated);
+
+//	mutex_unlock(&port->port_mutex);
 
 	if (ret < 0)
 		return ret;
@@ -1346,6 +1402,8 @@ static int init_port_console(struct port *port)
 	 */
 	if (early_put_chars)
 		early_put_chars = NULL;
+
+//	mutex_init(&port->port_mutex);
 
 	/* Notify host of port being opened */
 	send_control_msg(port, VIRTIO_CONSOLE_PORT_OPEN, 1);
@@ -1497,7 +1555,9 @@ static int add_port(struct ports_device *portdev, u32 id)
 
 	spin_lock_init(&port->inbuf_lock);
 	spin_lock_init(&port->outvq_lock);
-	init_waitqueue_head(&port->waitqueue);
+	spin_lock_init(&port->write_lock);
+
+	init_waitqueue_head(&port->waitqueue);	
 
 	/* We can safely ignore ENOSPC because it means
 	 * the queue already has buffers. Buffers are removed
